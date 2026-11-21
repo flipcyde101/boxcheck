@@ -28,6 +28,7 @@ async function evaluateSnapshot(
   sessionId: string,
   vp: ViewportSpec,
   url: string,
+  isFirstViewport: boolean,
   settleMs: number,
   timeoutMs: number
 ): Promise<CollectedPageSnapshot> {
@@ -42,9 +43,17 @@ async function evaluateSnapshot(
     sessionId
   );
 
-  const loadPromise = cdp.waitForEvent("Page.loadEventFired", timeoutMs, sessionId).catch(() => null);
-  await cdp.send("Page.navigate", { url }, sessionId, timeoutMs);
-  await loadPromise;
+  if (isFirstViewport) {
+    const loadPromise = cdp.waitForEvent("Page.loadEventFired", timeoutMs, sessionId).catch(() => null);
+    const navRes = await cdp.send("Page.navigate", { url }, sessionId, timeoutMs);
+    if (typeof navRes.errorText === "string" && navRes.errorText.length > 0) {
+      throw new Error(`Navigation failed for ${url}: ${navRes.errorText}`);
+    }
+    if (navRes.loaderId) {
+      await loadPromise;
+    }
+  }
+
   if (settleMs > 0) {
     await new Promise((r) => setTimeout(r, settleMs));
   }
@@ -65,15 +74,20 @@ async function evaluateSnapshot(
     throw new Error(`Failed to collect DOM geometry snapshot for ${url} at ${vp.label}`);
   }
 
+  // Re-verify post-redirect URL stays http/https (prevents chrome-error:// or file:// redirects)
+  validateHttpUrl(val.url);
+
   return {
     ...val,
     viewport: vp,
   };
 }
 
-export async function runAudit(opts: RunAuditOptions): Promise<AuditReport> {
+async function withCdpPage<T>(
+  opts: RunAuditOptions,
+  fn: (cdp: CdpClient, sessionId: string, validUrl: string, settleMs: number, timeoutMs: number) => Promise<T>
+): Promise<T> {
   const validUrl = validateHttpUrl(opts.url);
-  const startedAt = Date.now();
   const settleMs = opts.settleMs ?? 150;
   const timeoutMs = opts.timeoutMs ?? 15_000;
 
@@ -98,10 +112,27 @@ export async function runAudit(opts: RunAuditOptions): Promise<AuditReport> {
     await cdp.send("Page.enable", {}, sessionId);
     await cdp.send("Runtime.enable", {}, sessionId);
 
+    return await fn(cdp, sessionId, validUrl, settleMs, timeoutMs);
+  } finally {
+    if (cdp && targetId) {
+      await cdp.send("Target.closeTarget", { targetId }).catch(() => {});
+    }
+    if (cdp && browser.ownedProcess) {
+      await cdp.send("Browser.close").catch(() => {});
+    }
+    cdp?.close();
+    await browser.close();
+  }
+}
+
+export async function runAudit(opts: RunAuditOptions): Promise<AuditReport> {
+  const startedAt = Date.now();
+  return withCdpPage(opts, async (cdp, sessionId, validUrl, settleMs, timeoutMs) => {
     const viewportResults: ViewportAuditResult[] = [];
-    for (const vp of opts.viewports) {
+    for (let i = 0; i < opts.viewports.length; i++) {
+      const vp = opts.viewports[i];
       const vpStart = Date.now();
-      const snapshot = await evaluateSnapshot(cdp, sessionId, vp, validUrl, settleMs, timeoutMs);
+      const snapshot = await evaluateSnapshot(cdp, sessionId, vp, validUrl, i === 0, settleMs, timeoutMs);
       const defects = detectLayoutDefects(snapshot);
       await enrichDefectsWithCascade(cdp, sessionId, defects);
 
@@ -132,44 +163,15 @@ export async function runAudit(opts: RunAuditOptions): Promise<AuditReport> {
       totalDefects,
       viewports: viewportResults,
     };
-  } finally {
-    if (cdp && targetId) {
-      await cdp.send("Target.closeTarget", { targetId }).catch(() => {});
-    }
-    cdp?.close();
-    await browser.close();
-  }
+  });
 }
 
 export async function captureBaselineSnapshot(opts: RunAuditOptions): Promise<BaselineSnapshot> {
-  const validUrl = validateHttpUrl(opts.url);
-  const settleMs = opts.settleMs ?? 150;
-  const timeoutMs = opts.timeoutMs ?? 15_000;
-
-  const browser = await launchHeadlessBrowser({
-    cdpUrl: opts.cdpUrl,
-    chromePath: opts.chromePath,
-    timeoutMs,
-  });
-
-  let cdp: CdpClient | null = null;
-  let targetId: string | null = null;
-  try {
-    cdp = await CdpClient.connect(browser.wsUrl, timeoutMs);
-    const created = await cdp.send("Target.createTarget", { url: "about:blank" });
-    targetId = typeof created.targetId === "string" ? created.targetId : null;
-    if (!targetId) throw new Error("CDP Target.createTarget failed");
-
-    const attached = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
-    const sessionId = typeof attached.sessionId === "string" ? attached.sessionId : "";
-    if (!sessionId) throw new Error("CDP Target.attachToTarget failed");
-
-    await cdp.send("Page.enable", {}, sessionId);
-    await cdp.send("Runtime.enable", {}, sessionId);
-
+  return withCdpPage(opts, async (cdp, sessionId, validUrl, settleMs, timeoutMs) => {
     const viewports: BaselineViewport[] = [];
-    for (const vp of opts.viewports) {
-      const snapshot = await evaluateSnapshot(cdp, sessionId, vp, validUrl, settleMs, timeoutMs);
+    for (let i = 0; i < opts.viewports.length; i++) {
+      const vp = opts.viewports[i];
+      const snapshot = await evaluateSnapshot(cdp, sessionId, vp, validUrl, i === 0, settleMs, timeoutMs);
       const seen = new Set<string>();
       const elements = snapshot.elements
         .filter((e) => {
@@ -200,11 +202,5 @@ export async function captureBaselineSnapshot(opts: RunAuditOptions): Promise<Ba
       createdAt: new Date().toISOString(),
       viewports,
     };
-  } finally {
-    if (cdp && targetId) {
-      await cdp.send("Target.closeTarget", { targetId }).catch(() => {});
-    }
-    cdp?.close();
-    await browser.close();
-  }
+  });
 }

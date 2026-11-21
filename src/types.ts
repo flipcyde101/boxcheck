@@ -38,6 +38,10 @@ export interface CollectedElement {
   zIndex: number;
   occludedBySelector: string | null;
   occludedById: number | null;
+  insideHorizontalScroll?: boolean;
+  clippedOut?: boolean;
+  inert?: boolean;
+  lineClamp?: boolean;
 }
 
 export interface CollectedPageSnapshot {
@@ -124,5 +128,7 @@ export interface BaselineDiffReport {
   url: string;
   thresholdPx: number;
   totalChanges: number;
+  unmatchedViewports: string[];
   changes: GeometryDiffItem[];
+  truncated?: number;
 }

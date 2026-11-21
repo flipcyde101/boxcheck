@@ -3,34 +3,70 @@ export const DOM_COLLECTOR_SCRIPT = `(() => {
   const INTERACTIVE_TAGS = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"]);
   const INTERACTIVE_ROLES = new Set(["button", "link", "menuitem", "tab", "checkbox", "radio", "switch", "combobox"]);
 
-  function buildSelector(el) {
-    if (el.id && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(el.id)) {
-      return el.tagName.toLowerCase() + "#" + el.id;
+  function cssEscape(str) {
+    if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+      return CSS.escape(str);
     }
-    const tag = el.tagName.toLowerCase();
-    const classes = typeof el.className === "string"
-      ? el.className.trim().split(/\\s+/).filter((c) => c && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(c)).slice(0, 2)
-      : [];
-    const base = classes.length > 0 ? tag + "." + classes.join(".") : tag;
+    return str.replace(/[^A-Za-z0-9_-]/g, "\\\\$&");
+  }
+
+  function isUnique(sel) {
     try {
-      if (document.querySelectorAll(base).length === 1) return base;
-    } catch {}
+      return document.querySelectorAll(sel).length === 1;
+    } catch {
+      return false;
+    }
+  }
+
+  function nthOfType(el) {
     let idx = 1;
     let sib = el.previousElementSibling;
     while (sib) {
       if (sib.tagName === el.tagName) idx++;
       sib = sib.previousElementSibling;
     }
-    const parent = el.parentElement;
-    if (parent && parent.tagName !== "BODY" && parent.tagName !== "HTML") {
-      const pTag = parent.tagName.toLowerCase();
-      const pCls = typeof parent.className === "string"
-        ? parent.className.trim().split(/\\s+/).filter((c) => c && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(c)).slice(0, 1)
-        : [];
-      const pPart = parent.id ? pTag + "#" + parent.id : (pCls.length ? pTag + "." + pCls[0] : pTag);
-      return pPart + " > " + base + ":nth-of-type(" + idx + ")";
+    return idx;
+  }
+
+  function segmentFor(el, forceNth) {
+    const tag = el.tagName.toLowerCase();
+    if (el.id) {
+      const idSel = tag + "#" + cssEscape(el.id);
+      if (isUnique(idSel)) return idSel;
     }
-    return base + ":nth-of-type(" + idx + ")";
+    const classes = typeof el.className === "string"
+      ? el.className.trim().split(/\\s+/).filter((c) => c && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(c)).slice(0, 2)
+      : [];
+    const base = classes.length > 0 ? tag + "." + classes.join(".") : tag;
+    if (!forceNth && isUnique(base)) return base;
+    return base + ":nth-of-type(" + nthOfType(el) + ")";
+  }
+
+  function buildSelector(el) {
+    const first = segmentFor(el, false);
+    if (isUnique(first)) return first;
+
+    const parts = [segmentFor(el, true)];
+    let cur = el.parentElement;
+    while (cur && cur.tagName !== "HTML") {
+      if (cur.tagName === "BODY") {
+        parts.unshift("body");
+        break;
+      }
+      if (cur.id) {
+        const idSeg = cur.tagName.toLowerCase() + "#" + cssEscape(cur.id);
+        if (isUnique(idSeg)) {
+          parts.unshift(idSeg);
+          const candidate = parts.join(" > ");
+          if (isUnique(candidate)) return candidate;
+        }
+      }
+      parts.unshift(segmentFor(cur, true));
+      const candidate = parts.join(" > ");
+      if (isUnique(candidate)) return candidate;
+      cur = cur.parentElement;
+    }
+    return parts.join(" > ");
   }
 
   function directText(el) {
@@ -43,11 +79,12 @@ export const DOM_COLLECTOR_SCRIPT = `(() => {
     return out.trim();
   }
 
-  const allNodes = Array.from(document.querySelectorAll("body *")).slice(0, 1200);
+  const allNodes = Array.from(document.querySelectorAll("body *")).slice(0, 1400);
   const idMap = new Map();
   let nextId = 1;
   for (const el of allNodes) {
     if (SKIP_TAGS.has(el.tagName)) continue;
+    if (el instanceof SVGElement && el.tagName.toLowerCase() !== "svg") continue;
     idMap.set(el, nextId++);
   }
 
@@ -64,14 +101,50 @@ export const DOM_COLLECTOR_SCRIPT = `(() => {
     const ancestorIds = [];
     let p = el.parentElement;
     let parentId = null;
-    while (p) {
+    let effectiveAriaHidden = el.getAttribute("aria-hidden") === "true";
+    let effectiveOpacity = Number.parseFloat(cs.opacity || "1");
+    let effectiveInert = el.hasAttribute("inert");
+    let insideHorizontalScroll = false;
+    let clipLeft = -Infinity;
+    let clipTop = -Infinity;
+    let clipRight = Infinity;
+    let clipBottom = Infinity;
+
+    while (p && p.tagName !== "HTML") {
       const pid = idMap.get(p);
       if (pid !== undefined) {
         if (parentId === null) parentId = pid;
         ancestorIds.push(pid);
       }
+      if (p.getAttribute("aria-hidden") === "true") effectiveAriaHidden = true;
+      if (p.hasAttribute("inert")) effectiveInert = true;
+      const pcs = window.getComputedStyle(p);
+      const pOp = Number.parseFloat(pcs.opacity || "1");
+      if (Number.isFinite(pOp)) effectiveOpacity *= pOp;
+
+      if (pcs.overflowX === "auto" || pcs.overflowX === "scroll" || pcs.overflowX === "hidden" || pcs.overflowX === "clip") {
+        if (p.tagName !== "BODY") {
+          const pr = p.getBoundingClientRect();
+          if (pcs.overflowX === "auto" || pcs.overflowX === "scroll") {
+            insideHorizontalScroll = true;
+          }
+          clipLeft = Math.max(clipLeft, pr.left);
+          clipRight = Math.min(clipRight, pr.right);
+        }
+      }
+      if (pcs.overflowY === "auto" || pcs.overflowY === "scroll" || pcs.overflowY === "hidden" || pcs.overflowY === "clip") {
+        if (p.tagName !== "BODY") {
+          const pr = p.getBoundingClientRect();
+          clipTop = Math.max(clipTop, pr.top);
+          clipBottom = Math.min(clipBottom, pr.bottom);
+        }
+      }
       p = p.parentElement;
     }
+
+    const visW = Math.min(r.right, clipRight) - Math.max(r.left, clipLeft);
+    const visH = Math.min(r.bottom, clipBottom) - Math.max(r.top, clipTop);
+    const clippedOut = visW < 2 || visH < 2;
 
     const role = el.getAttribute("role");
     const interactive =
@@ -81,12 +154,16 @@ export const DOM_COLLECTOR_SCRIPT = `(() => {
       cs.cursor === "pointer";
 
     const dText = directText(el);
-    const hasDirectText = dText.length > 0 || (interactive && (el.innerText || "").trim().length > 0);
-    const text = dText || (interactive ? (el.innerText || "").trim().slice(0, 80) : "");
+    const isLeafInteractive = (el.tagName === "BUTTON" || el.tagName === "A") && el.children.length === 0;
+    const hasDirectText = dText.length > 0 || (isLeafInteractive && (el.innerText || "").trim().length > 0);
+    const text = dText || (isLeafInteractive ? (el.innerText || "").trim().slice(0, 80) : "");
+
+    const webkitLineClamp = cs.getPropertyValue("-webkit-line-clamp") || "";
+    const lineClamp = webkitLineClamp !== "" && webkitLineClamp !== "none" && Number.parseInt(webkitLineClamp, 10) > 0;
 
     let occludedBySelector = null;
     let occludedById = null;
-    if (interactive && r.width >= 8 && r.height >= 8) {
+    if (interactive && !clippedOut && !effectiveAriaHidden && !effectiveInert && effectiveOpacity >= 0.05 && r.width >= 8 && r.height >= 8) {
       const cx = r.left + r.width / 2;
       const cy = r.top + r.height / 2;
       if (cx >= 1 && cx <= vw - 1 && cy >= 1 && cy <= vh - 1) {
@@ -121,12 +198,16 @@ export const DOM_COLLECTOR_SCRIPT = `(() => {
       whiteSpace: cs.whiteSpace,
       position: cs.position,
       pointerEvents: cs.pointerEvents,
-      ariaHidden: el.getAttribute("aria-hidden") === "true",
+      ariaHidden: effectiveAriaHidden,
       visibility: cs.visibility,
-      opacity: Number.parseFloat(cs.opacity || "1"),
+      opacity: effectiveOpacity,
       zIndex: Number.isFinite(zParsed) ? zParsed : 0,
       occludedBySelector,
       occludedById,
+      insideHorizontalScroll,
+      clippedOut,
+      inert: effectiveInert,
+      lineClamp,
     });
   }
 

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,52 @@ export interface BrowserHandle {
   userDataDir: string | null;
   ownedProcess: boolean;
   close: () => Promise<void>;
+}
+
+interface ActiveBrowserEntry {
+  child: ChildProcess;
+  userDataDir: string;
+}
+
+const activeBrowsers = new Set<ActiveBrowserEntry>();
+let signalHooksInstalled = false;
+
+function killProcessTreeSync(pid: number | undefined): void {
+  if (!pid) return;
+  if (process.platform === "win32") {
+    try {
+      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    } catch {
+      // ignore
+    }
+  } else {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function installGlobalSignalHooks(): void {
+  if (signalHooksInstalled) return;
+  signalHooksInstalled = true;
+
+  const handleSignal = (sig: NodeJS.Signals, exitCode: number) => {
+    for (const entry of activeBrowsers) {
+      killProcessTreeSync(entry.child.pid);
+      try {
+        rmSync(entry.userDataDir, { recursive: true, force: true });
+      } catch {
+        // best-effort on abrupt signal
+      }
+    }
+    activeBrowsers.clear();
+    process.exit(exitCode);
+  };
+
+  process.on("SIGINT", () => handleSignal("SIGINT", 130));
+  process.on("SIGTERM", () => handleSignal("SIGTERM", 143));
 }
 
 export function findChromeExecutable(explicitPath?: string): string | null {
@@ -52,12 +98,21 @@ export function findChromeExecutable(explicitPath?: string): string | null {
   return null;
 }
 
-async function resolveExternalCdpWsUrl(cdpUrl: string): Promise<string> {
-  if (cdpUrl.startsWith("ws://") || cdpUrl.startsWith("wss://")) {
-    return cdpUrl;
+async function resolveExternalCdpWsUrl(cdpUrl: string, timeoutMs: number): Promise<string> {
+  let parsed: URL;
+  try {
+    parsed = new URL(cdpUrl);
+  } catch {
+    throw new Error(`Invalid --cdp-url "${cdpUrl}"`);
   }
-  const base = cdpUrl.replace(/\/+$/, "");
-  const res = await fetch(`${base}/json/version`);
+  if (!["http:", "https:", "ws:", "wss:"].includes(parsed.protocol)) {
+    throw new Error(`Unsupported --cdp-url protocol "${parsed.protocol}". Expected http, https, ws, or wss.`);
+  }
+  if (parsed.protocol === "ws:" || parsed.protocol === "wss:") {
+    return parsed.toString();
+  }
+  const base = parsed.toString().replace(/\/+$/, "");
+  const res = await fetch(`${base}/json/version`, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) {
     throw new Error(`Failed to query CDP endpoint ${base}/json/version (HTTP ${res.status})`);
   }
@@ -69,39 +124,61 @@ async function resolveExternalCdpWsUrl(cdpUrl: string): Promise<string> {
 }
 
 async function removeDirWithRetry(dir: string): Promise<void> {
-  for (let attempt = 0; attempt < 12; attempt++) {
+  for (let attempt = 0; attempt < 15; attempt++) {
     try {
       rmSync(dir, { recursive: true, force: true });
       if (!existsSync(dir)) return;
     } catch {
-      // Windows Chrome child processes can hold profile locks briefly after exit
+      // Windows Chrome subprocesses can release profile locks slightly after exit
     }
     await new Promise((r) => setTimeout(r, 120));
   }
 }
 
-async function terminateProcess(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.killed) return;
+async function terminateProcessTree(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
   await new Promise<void>((resolve) => {
-    const done = () => {
-      clearTimeout(killTimer);
+    let settled = false;
+    let hardTimer: ReturnType<typeof setTimeout> | undefined;
+    let giveUpTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (hardTimer) clearTimeout(hardTimer);
+      if (giveUpTimer) clearTimeout(giveUpTimer);
       resolve();
     };
-    child.once("exit", done);
+    child.once("exit", finish);
+
+    if (process.platform === "win32") {
+      // Give Browser.close 250ms to exit cleanly, then force-kill full tree via taskkill /T /F
+      hardTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          killProcessTreeSync(child.pid);
+        }
+      }, 250);
+      giveUpTimer = setTimeout(finish, 3_000);
+      return;
+    }
+
     try {
       child.kill("SIGTERM");
     } catch {
-      done();
+      finish();
       return;
     }
-    const killTimer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // ignore
+    hardTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
       }
-      resolve();
-    }, 2_500);
+    }, 1_500);
+    giveUpTimer = setTimeout(finish, 3_500);
   });
 }
 
@@ -110,8 +187,10 @@ export async function launchHeadlessBrowser(opts: {
   chromePath?: string;
   timeoutMs?: number;
 } = {}): Promise<BrowserHandle> {
+  const timeoutMs = opts.timeoutMs ?? 12_000;
+
   if (opts.cdpUrl) {
-    const wsUrl = await resolveExternalCdpWsUrl(opts.cdpUrl);
+    const wsUrl = await resolveExternalCdpWsUrl(opts.cdpUrl, timeoutMs);
     return {
       wsUrl,
       userDataDir: null,
@@ -152,53 +231,49 @@ export async function launchHeadlessBrowser(opts: {
     windowsHide: true,
   });
 
-  const cleanupOnSignal = () => {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // ignore
-    }
-    try {
-      rmSync(userDataDir, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
-  };
-  process.once("SIGINT", cleanupOnSignal);
-  process.once("SIGTERM", cleanupOnSignal);
+  const activeEntry: ActiveBrowserEntry = { child, userDataDir };
+  activeBrowsers.add(activeEntry);
+  installGlobalSignalHooks();
 
-  const timeoutMs = opts.timeoutMs ?? 12_000;
   let wsUrl: string;
   try {
     wsUrl = await new Promise<string>((resolve, reject) => {
       let stderrBuf = "";
+      const cleanup = () => {
+        clearTimeout(timer);
+        child.stderr?.off("data", onStderr);
+        child.off("error", onError);
+        child.off("exit", onExit);
+      };
       const timer = setTimeout(() => {
+        cleanup();
         reject(new Error(`Timed out waiting for headless Chrome DevTools URL. Stderr: ${stderrBuf.slice(-300)}`));
       }, timeoutMs);
 
-      child.stderr?.on("data", (chunk: Buffer) => {
+      const onStderr = (chunk: Buffer) => {
         stderrBuf += chunk.toString("utf8");
         const match = /DevTools listening on (ws:\/\/[^\s]+)/.exec(stderrBuf);
         if (match) {
-          clearTimeout(timer);
+          cleanup();
           resolve(match[1]);
         }
-      });
-
-      child.once("error", (err) => {
-        clearTimeout(timer);
+      };
+      const onError = (err: Error) => {
+        cleanup();
         reject(err);
-      });
-
-      child.once("exit", (code) => {
-        clearTimeout(timer);
+      };
+      const onExit = (code: number | null) => {
+        cleanup();
         reject(new Error(`Headless Chrome exited early (code ${code ?? "null"}): ${stderrBuf.slice(-300)}`));
-      });
+      };
+
+      child.stderr?.on("data", onStderr);
+      child.once("error", onError);
+      child.once("exit", onExit);
     });
   } catch (err) {
-    process.off("SIGINT", cleanupOnSignal);
-    process.off("SIGTERM", cleanupOnSignal);
-    await terminateProcess(child);
+    activeBrowsers.delete(activeEntry);
+    await terminateProcessTree(child);
     await removeDirWithRetry(userDataDir);
     throw err;
   }
@@ -211,9 +286,8 @@ export async function launchHeadlessBrowser(opts: {
     close: async () => {
       if (closed) return;
       closed = true;
-      process.off("SIGINT", cleanupOnSignal);
-      process.off("SIGTERM", cleanupOnSignal);
-      await terminateProcess(child);
+      activeBrowsers.delete(activeEntry);
+      await terminateProcessTree(child);
       await removeDirWithRetry(userDataDir);
     },
   };

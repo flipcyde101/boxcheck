@@ -10,11 +10,19 @@ interface PendingCall {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface EventWaiter {
+  method: string;
+  sessionId?: string;
+  resolve: (ev: CdpEventMessage) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class CdpClient {
   private ws: WebSocket;
   private nextId = 1;
   private readonly pending = new Map<number, PendingCall>();
-  private readonly listeners = new Map<string, Set<(msg: CdpEventMessage) => void>>();
+  private readonly waiters = new Set<EventWaiter>();
   private closed = false;
 
   private constructor(ws: WebSocket) {
@@ -48,9 +56,12 @@ export class CdpClient {
           params: (msg.params as Record<string, unknown>) ?? {},
           sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined,
         };
-        const set = this.listeners.get(msg.method);
-        if (set) {
-          for (const fn of set) fn(event);
+        for (const w of [...this.waiters]) {
+          if (w.method !== event.method) continue;
+          if (w.sessionId && event.sessionId !== w.sessionId) continue;
+          clearTimeout(w.timer);
+          this.waiters.delete(w);
+          w.resolve(event);
         }
       }
     });
@@ -61,6 +72,11 @@ export class CdpClient {
         clearTimeout(entry.timer);
         entry.reject(new Error("CDP WebSocket closed before response"));
         this.pending.delete(id);
+      }
+      for (const w of [...this.waiters]) {
+        clearTimeout(w.timer);
+        this.waiters.delete(w);
+        w.reject(new Error(`CDP WebSocket closed while waiting for ${w.method}`));
       }
     });
   }
@@ -90,7 +106,7 @@ export class CdpClient {
     sessionId?: string,
     timeoutMs = 15_000
   ): Promise<Record<string, unknown>> {
-    if (this.closed) {
+    if (this.closed || this.ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error(`CDP client is closed (cannot call ${method})`));
     }
     const id = this.nextId++;
@@ -104,33 +120,32 @@ export class CdpClient {
       }, timeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });
-      this.ws.send(JSON.stringify(payload));
+      try {
+        this.ws.send(JSON.stringify(payload));
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
   waitForEvent(method: string, timeoutMs = 10_000, sessionId?: string): Promise<CdpEventMessage> {
+    if (this.closed || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error(`CDP client is closed (cannot wait for ${method})`));
+    }
     return new Promise((resolve, reject) => {
-      const onEvent = (ev: CdpEventMessage) => {
-        if (sessionId && ev.sessionId !== sessionId) return;
-        cleanup();
-        resolve(ev);
+      const waiter: EventWaiter = {
+        method,
+        sessionId,
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          this.waiters.delete(waiter);
+          reject(new Error(`Timed out waiting for CDP event: ${method}`));
+        }, timeoutMs),
       };
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error(`Timed out waiting for CDP event: ${method}`));
-      }, timeoutMs);
-
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.listeners.get(method)?.delete(onEvent);
-      };
-
-      let set = this.listeners.get(method);
-      if (!set) {
-        set = new Set();
-        this.listeners.set(method, set);
-      }
-      set.add(onEvent);
+      this.waiters.add(waiter);
     });
   }
 

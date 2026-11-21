@@ -222,7 +222,7 @@ async function main(): Promise<void> {
     });
     const diff = diffBaselines(prev, curr, args.thresholdPx);
     console.log(JSON.stringify(diff, null, 2));
-    if (args.failOnDefects && diff.totalChanges > 0) {
+    if (args.failOnDefects && (diff.totalChanges > 0 || diff.unmatchedViewports.length > 0)) {
       process.exitCode = 1;
     }
   }

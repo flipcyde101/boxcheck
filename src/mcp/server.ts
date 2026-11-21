@@ -18,7 +18,7 @@ export interface McpServerOptions {
 }
 
 interface JsonRpcRequest {
-  jsonrpc?: string;
+  jsonrpc: "2.0";
   id?: string | number | null;
   method: string;
   params?: Record<string, unknown>;
@@ -76,13 +76,15 @@ export function startMcpStdioServer(opts: McpServerOptions): () => void {
   const output = opts.output ?? process.stdout;
   const auditRunner = opts.auditFn ?? runAudit;
   const baselineRunner = opts.baselineFn ?? captureBaselineSnapshot;
+  let closed = false;
+  let queue: Promise<void> = Promise.resolve();
 
   const send = (payload: Record<string, unknown>): void => {
+    if (closed || output.writableEnded || output.destroyed) return;
     output.write(`${JSON.stringify(payload)}\n`);
   };
 
   const handleRequest = async (req: JsonRpcRequest): Promise<void> => {
-    // Notifications have no id and expect no reply
     if (req.id === undefined || req.id === null) {
       return;
     }
@@ -233,9 +235,9 @@ export function startMcpStdioServer(opts: McpServerOptions): () => void {
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-    let parsed: JsonRpcRequest;
+    let parsed: unknown;
     try {
-      parsed = JSON.parse(trimmed) as JsonRpcRequest;
+      parsed = JSON.parse(trimmed);
     } catch {
       send({
         jsonrpc: "2.0",
@@ -244,10 +246,48 @@ export function startMcpStdioServer(opts: McpServerOptions): () => void {
       });
       return;
     }
-    void handleRequest(parsed);
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      send({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Invalid Request" },
+      });
+      return;
+    }
+
+    const rec = parsed as Record<string, unknown>;
+    if (rec.jsonrpc !== "2.0" || typeof rec.method !== "string" || rec.method.length === 0) {
+      const reqId = typeof rec.id === "string" || typeof rec.id === "number" ? rec.id : null;
+      send({
+        jsonrpc: "2.0",
+        id: reqId,
+        error: { code: -32600, message: "Invalid Request" },
+      });
+      return;
+    }
+
+    // Serialize tool executions so concurrent snap/diff never race or spawn unbounded Chromes
+    queue = queue
+      .then(() => handleRequest(rec as unknown as JsonRpcRequest))
+      .catch((err) => {
+        const reqId = typeof rec.id === "string" || typeof rec.id === "number" ? rec.id : null;
+        if (reqId !== null) {
+          send({
+            jsonrpc: "2.0",
+            id: reqId,
+            error: { code: -32603, message: (err as Error).message },
+          });
+        }
+      });
+  });
+
+  rl.on("close", () => {
+    closed = true;
   });
 
   return () => {
+    closed = true;
     rl.close();
   };
 }

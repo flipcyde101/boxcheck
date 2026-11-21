@@ -6,7 +6,7 @@ const MIN_CLIP_DELTA_PX = 6;
 const MIN_OVERFLOW_PX = 4;
 
 function isVisibleCandidate(el: CollectedElement): boolean {
-  if (el.ariaHidden) return false;
+  if (el.ariaHidden || el.inert || el.clippedOut) return false;
   if (el.visibility !== "visible") return false;
   if (el.opacity < 0.05) return false;
   if (el.pointerEvents === "none") return false;
@@ -18,9 +18,20 @@ function isContentBearing(el: CollectedElement): boolean {
   return el.interactive || (el.hasDirectText && el.text.trim().length > 0);
 }
 
+function isSmallCornerBadge(el: CollectedElement): boolean {
+  return (
+    el.position === "absolute" &&
+    !el.interactive &&
+    el.rect.w <= 36 &&
+    el.rect.h <= 28
+  );
+}
+
 function isIntentionalOverlayLayer(el: CollectedElement): boolean {
   if (el.position === "fixed" || el.position === "sticky") return true;
-  if (el.role === "tooltip" || el.role === "dialog" || el.role === "menu") return true;
+  if (el.tag === "dialog") return true;
+  if (el.role === "tooltip" || el.role === "dialog" || el.role === "menu" || el.role === "listbox") return true;
+  if (isSmallCornerBadge(el)) return true;
   return false;
 }
 
@@ -91,28 +102,39 @@ export function detectLayoutDefects(snapshot: CollectedPageSnapshot): LayoutDefe
   if (docOverflow >= MIN_OVERFLOW_PX) {
     const overflowing = visible
       .filter((el) => {
+        if (el.insideHorizontalScroll) return false;
+        const clipsSelf =
+          el.overflowX === "hidden" ||
+          el.overflowX === "clip" ||
+          el.overflowX === "auto" ||
+          el.overflowX === "scroll";
         const rightEdgeOverflow = Math.round(el.rect.x + el.rect.w - vw);
-        const internalOverflow =
-          el.overflowX !== "hidden" &&
-          el.overflowX !== "clip" &&
-          el.overflowX !== "auto" &&
-          el.overflowX !== "scroll"
-            ? Math.round(el.scrollWidth - el.clientWidth)
-            : 0;
+        const internalOverflow = clipsSelf ? 0 : Math.round(el.scrollWidth - el.clientWidth);
         return rightEdgeOverflow >= MIN_OVERFLOW_PX || internalOverflow >= MIN_OVERFLOW_PX;
       })
-      .sort((a, b) => (b.rect.x + b.rect.w) - (a.rect.x + a.rect.w));
+      // Prefer containers with explicit protrusion (wider right edge, then shallower depth to pick root offender cleanly)
+      .sort((a, b) => {
+        const rightDiff = b.rect.x + b.rect.w - (a.rect.x + a.rect.w);
+        if (Math.abs(rightDiff) > 4) return rightDiff;
+        return a.ancestorIds.length - b.ancestorIds.length;
+      });
 
-    const reportedOverflowIds = new Set<number>();
+    const reportedOverflowEls: CollectedElement[] = [];
     for (const el of overflowing) {
-      // Skip if an already-reported descendant/ancestor handles the exact same band
-      if (el.ancestorIds.some((aid) => reportedOverflowIds.has(aid))) continue;
-      const overflowPx = Math.max(
-        Math.round(el.rect.x + el.rect.w - vw),
-        Math.round(el.scrollWidth - el.clientWidth)
-      );
+      // Bidirectional dedupe: skip if any ancestor OR descendant is already reported
+      if (reportedOverflowEls.some((rep) => isAncestorOrDescendant(el, rep))) continue;
+
+      const clipsSelf =
+        el.overflowX === "hidden" ||
+        el.overflowX === "clip" ||
+        el.overflowX === "auto" ||
+        el.overflowX === "scroll";
+      const rightEdgeOverflow = Math.round(el.rect.x + el.rect.w - vw);
+      const internalOverflow = clipsSelf ? 0 : Math.round(el.scrollWidth - el.clientWidth);
+      const overflowPx = Math.max(rightEdgeOverflow, internalOverflow);
       if (overflowPx < MIN_OVERFLOW_PX) continue;
-      reportedOverflowIds.add(el.id);
+
+      reportedOverflowEls.push(el);
       defects.push({
         kind: "H_OVERFLOW",
         vp,
@@ -122,7 +144,7 @@ export function detectLayoutDefects(snapshot: CollectedPageSnapshot): LayoutDefe
       });
     }
 
-    if (reportedOverflowIds.size === 0) {
+    if (reportedOverflowEls.length === 0) {
       defects.push({
         kind: "H_OVERFLOW",
         vp,
@@ -133,10 +155,10 @@ export function detectLayoutDefects(snapshot: CollectedPageSnapshot): LayoutDefe
     }
   }
 
-  // 3. TEXT_CLIPPED: clipped text inside overflow:hidden/clip without intentional ellipsis
+  // 3. TEXT_CLIPPED: clipped text inside overflow:hidden/clip without intentional ellipsis or line-clamp
   for (const el of visible) {
     if (!el.hasDirectText || el.text.trim().length === 0) continue;
-    if (el.textOverflow === "ellipsis") continue;
+    if (el.textOverflow === "ellipsis" || el.lineClamp) continue;
 
     const clippedX =
       (el.overflowX === "hidden" || el.overflowX === "clip") &&
@@ -166,7 +188,7 @@ export function detectLayoutDefects(snapshot: CollectedPageSnapshot): LayoutDefe
 
   // 4. OFF_SCREEN: visible interactive elements pushed >50% outside viewport horizontal bounds
   for (const el of visible) {
-    if (!el.interactive || el.rect.w < 12) continue;
+    if (!el.interactive || el.insideHorizontalScroll || el.rect.w < 12) continue;
     const visLeft = Math.max(0, el.rect.x);
     const visRight = Math.min(vw, el.rect.x + el.rect.w);
     const visibleWidth = Math.max(0, visRight - visLeft);

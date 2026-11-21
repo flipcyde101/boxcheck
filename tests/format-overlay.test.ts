@@ -40,10 +40,11 @@ describe("compact <500-token formatter & collision overlay HTML", () => {
     const jsonStr = formatCompactAuditJson(makeSampleReport(40), 10);
     const parsed = JSON.parse(jsonStr);
     expect(parsed.totalDefects).toBe(40);
-    expect(parsed.defects).toHaveLength(10);
-    expect(parsed.truncated).toBe(30);
-    // Rough token budget check (~4 chars/token -> < 2000 chars for 10 concise defects)
-    expect(jsonStr.length).toBeLessThan(2200);
+    expect(parsed.defects.length).toBeGreaterThan(0);
+    expect(parsed.defects.length).toBeLessThanOrEqual(10);
+    expect(parsed.truncated).toBe(40 - parsed.defects.length);
+    // Strict token budget check (~4 chars/token -> <= 1800 chars = <450 tokens)
+    expect(jsonStr.length).toBeLessThanOrEqual(1800);
   });
 
   it("renders readable terminal summary and self-contained HTML collision overlay with SVG bounding boxes", () => {

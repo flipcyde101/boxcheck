@@ -55,5 +55,12 @@ export function validateHttpUrl(rawUrl: string): string {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error(`Unsupported URL protocol "${parsed.protocol}". Only http: and https: URLs are allowed.`);
   }
+  if (parsed.username || parsed.password) {
+    throw new Error("URLs with embedded credentials (username/password) are not allowed.");
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (host === "169.254.169.254" || host === "metadata.google.internal") {
+    throw new Error(`Blocked cloud metadata host "${host}".`);
+  }
   return parsed.toString();
 }
