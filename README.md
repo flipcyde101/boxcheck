@@ -6,6 +6,10 @@
 [![Node >=24](https://img.shields.io/badge/node-%3E%3D24.0.0-brightgreen.svg)](https://nodejs.org)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20(raw%20CDP)-informational.svg)](#architecture)
 
+[![Watch the 15-second boxcheck demo](https://github.com/flipcyde101/boxcheck/releases/download/v0.1.0/boxcheck-poster.png)](https://github.com/flipcyde101/boxcheck/releases/download/v0.1.0/boxcheck-demo.mp4)
+
+[Watch the 15-second boxcheck demo (MP4)](https://github.com/flipcyde101/boxcheck/releases/download/v0.1.0/boxcheck-demo.mp4)
+
 ![boxcheck visual collision report and mobile defect breakdown](./docs/hero-collision-report.png)
 
 ---
